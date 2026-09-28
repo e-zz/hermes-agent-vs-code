@@ -1,0 +1,3 @@
+# VS Code extension runtime state
+.vscode-test/
+node_modules/
