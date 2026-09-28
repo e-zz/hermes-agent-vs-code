@@ -661,7 +661,11 @@ class HermesSidebarProvider {
       );
       for (const { group, tab } of misplacedDocuments) {
         const targetColumn = await this.ensureDocumentColumn();
-        const opened = await this.openDocumentTab(tab, targetColumn);
+        // Background relocation (triggered by tab/focus events, not by a user
+        // click) must not steal keyboard focus: if the user is typing in the
+        // webview prompt, a focus grab here sends every subsequent keystroke to
+        // the editor. User-initiated opens keep the default preserveFocus:false.
+        const opened = await this.openDocumentTab(tab, targetColumn, { preserveFocus: true });
         if (opened && group.tabs.includes(tab)) await vscode.window.tabGroups.close(tab, true);
       }
     } finally {
@@ -669,13 +673,13 @@ class HermesSidebarProvider {
     }
   }
 
-  async openDocumentTab(tab, viewColumn) {
+  async openDocumentTab(tab, viewColumn, { preserveFocus = false } = {}) {
     const input = tab?.input;
     if (input instanceof vscode.TabInputTextDiff || input instanceof vscode.TabInputNotebookDiff) {
       try {
         await vscode.commands.executeCommand("vscode.diff", input.original, input.modified, tab.label, {
           preview: false,
-          preserveFocus: false,
+          preserveFocus,
           viewColumn
         });
         return true;
@@ -685,7 +689,7 @@ class HermesSidebarProvider {
       }
     }
     const uri = this.tabUri(tab);
-    return uri ? this.openDocumentUri(uri, { preview: false, viewColumn }) : false;
+    return uri ? this.openDocumentUri(uri, { preview: false, viewColumn, preserveFocus }) : false;
   }
 
   async onMessage(message, panel) {
@@ -1035,12 +1039,12 @@ class HermesSidebarProvider {
     vscode.window.showWarningMessage(`Hermes could not find the generated document: ${value}`);
   }
 
-  async openDocumentUri(uri, { preview = true, viewColumn } = {}) {
+  async openDocumentUri(uri, { preview = true, viewColumn, preserveFocus = false } = {}) {
     const targetColumn = viewColumn ?? await this.ensureDocumentColumn();
     try {
       await vscode.commands.executeCommand("vscode.open", uri, {
         preview,
-        preserveFocus: false,
+        preserveFocus,
         viewColumn: targetColumn
       });
       return true;
