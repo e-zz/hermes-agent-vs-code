@@ -63,7 +63,42 @@ if (samePath(realPath, currentExecPath) || samePath(executablePath, currentExecP
 }
 ```
 
-该检查的意图是排除 VS Code / Electron 自身，**但上一行的 `APPLICATION_RUNTIME_PATTERN`（`/code helper|visual studio code|electron/i`）已经覆盖了这些情况** —— 因此这行等式检查只剩误伤：当扩展宿主的 `process.execPath` 恰好是某个真实 `node.exe` 时，**唯一可用的 Node 被当作"自己"排除**。
+该检查的意图是排除 VS Code / Electron 自身。
+
+**⚠️ 更正（本报告首版在此处判断有误）**：首版称「上一行的 `APPLICATION_RUNTIME_PATTERN` 已经覆盖了这些情况，故该等式检查纯属冗余」。**该说法错误，已实测推翻。**
+
+实测 `APPLICATION_RUNTIME_PATTERN = /(?:code helper|visual studio code|electron)/i` 对 Windows 的 `Code.exe` **不匹配**（`pass`）：
+
+```
+  pass  C:\Program Files\Microsoft VS Code\Code.exe     ← 未被阻挡
+  BLOCK /Applications/.../Code Helper                    ← macOS 形态可挡
+  BLOCK C:\app\node_modules\electron\dist\electron.exe   ← 裸 electron 可挡
+```
+
+即：该路径正则只覆盖 macOS 的 `Code Helper` 与未打包的 `electron.exe`，**漏掉 Windows 上打包后的 `Code.exe` / `Code - Insiders.exe`**（其路径既不含 "visual studio code" 也不含 "electron"）。
+
+**但等式检查依然是可以移除的 —— 理由与首版不同（实测）**：真正拦住 `Code.exe` 的不是路径正则，而是 **probe 响应解析**。实测把 `Code.exe` 当作候选去 probe：
+
+```
+=== VS Code Code.exe ===
+  status: 0   stdout: (空)
+  stderr: Warning: 'p' is not in the list of known options...
+          [main ...] Conflict in settings file vscode-userdata:...
+  => JSON.parse 失败 → validateProbeResult 首行（:33 版本校验之前）即拒绝
+```
+
+**注意 `Code.exe` 的实际行为**：它不把 `-p` 当 Node 参数，而是**启动了一个完整的 VS Code 实例**（stderr 显示在加载 userdata settings）。因此它**不可能**通过 probe，也就**永远到不了等式检查那一行**。
+
+**三层防线实测归属**：
+
+| 候选 | 被哪一层拦下 | 等式检查参与？ |
+|---|---|---|
+| VS Code `Code.exe` | probe 响应无法解析（`:33` 之前） | ❌ 不参与 |
+| Electron 伪装成 node（`ELECTRON_RUN_AS_NODE`） | `:36` `electronVersion`（probe 已先 `delete env.ELECTRON_RUN_AS_NODE`） | ❌ 不参与 |
+| 老版 Node 缺 `randomUUID` | `:39` `supportsBackgroundHost` | ❌ 不参与 |
+| **系统 `node.exe`（合法候选）** | **等式检查** | ✅ **唯一受害者** |
+
+**结论**：等式检查是**不可达防御** —— 它唯一能拦下的对象（真实 Node），恰好是唯一合法的对象。`Code.exe` / Electron 在到达该行之前已被 probe 层拒绝。
 
 **复现方法（实测，可独立复核）**：
 - 用 `C:\Program Files\nodejs\node.exe` 作为**当前进程**调用 `resolveNodeRuntime` → **失败**，错误即上面那句
@@ -76,11 +111,40 @@ if (samePath(realPath, currentExecPath) || samePath(executablePath, currentExecP
 
 **推断（未直接验证）**：`default` profile 之所以正常，是因为其 `background-host/` 已存在（含 `runtime/` 与 `endpoint.json`），**绕过了 runtime 解析**。未读到 VS Code 进程环境（需提权），故未能直接证据化。
 
-**用户采取的绕法**：在 typst profile 显式配置 `hermesAgent.nodePath` 指向一个**不等于宿主 execPath** 的 Node。用户确认 `fixed now`。
+**用户采取的绕法**：在 typst profile 显式配置 `hermesAgent.nodePath` 指向一个**不等于宿主 execPath** 的 Node。用户确认 `fixed now`。**该绕法现已成为历史 —— 代码已修，配置不再需要。**
 
-**干净修法**：删除那句冗余的等式检查（`APPLICATION_RUNTIME_PATTERN` 已足够）。
+**已实施的修法（实测验证）**：
 
-**可核验点**：读 `lib/node-runtime.js` 的 `validateProbeResult`；按上述"换进程即复现/消失"方法复现；在新 profile 首次启动观察 `background-host/` 是否被创建。
+1. 删除等式检查（`:47`）—— 见上文「三层防线实测归属」，它拦不下 `Code.exe`/Electron，只会误伤真 Node。
+2. **补强** `APPLICATION_RUNTIME_PATTERN`，使其真正覆盖 Windows 形态：
+   ```
+   /(?:code helper|visual studio code|electron|(?:^|[\\/])code(?: - insiders)?\.exe$)/i
+   ```
+   （首版误以为它已覆盖，实测证明未覆盖；补上后路径层与 probe 层各司其职。）
+3. 顺带删除因之成为死代码的 `samePath()`（定义后无任何调用者）。
+4. `validateProbeResult` 的 `currentExecPath` 形参**保留**（它是导出函数的签名，删掉是 API 变更；以 `void currentExecPath;` 显式标注不再参与判定）。
+
+**改动量**：`lib/node-runtime.js` +16 / −9 行。
+
+**红蓝验证（实测）**：同一组输入，baseline `d616d85` 与修复后对比 ——
+
+| 场景（`resolveNodeRuntime`，`configuredPath` = 系统 node） | baseline | 修复后 |
+|---|---|---|
+| `currentExecPath` **等于**该系统 node | ❌ 抛错（即 A2 症状） | ✅ 解析成功 `24.16.0` |
+| `currentExecPath` 为无关进程 | ✅ 解析成功 | ✅ 解析成功 |
+
+即：**red-on-base 成立** —— baseline 拒绝的唯一候选正是唯一合法的候选。
+
+**回归验证（实测，12 项全通过）**：
+- 系统 node 作为自身 execPath → 解析成功（回归项）
+- `Code.exe` 作为候选 → 仍被拒绝（`INVALID_CONFIGURED_NODE`）
+- 无关 execPath 的正常场景 → 不受影响
+- 扩展后的正则：`Code.exe` / `Code - Insiders.exe` / `/usr/share/code/code.exe` 全部阻挡；`node.exe` / `nodejs\node` 全部放行
+- `validateProbeResult` 直调：同路径 runtime 接受；`electronVersion` 非空仍拒绝
+
+**应用补丁**：`patches/07-node-runtime-identity-check.patch`（51 行）。从 `d616d85` 干净应用合并补丁后，7 个修复文件逐字节一致。
+
+**可核验点**：读 `lib/node-runtime.js` 的 `validateProbeResult`（等式检查应已不在）；按上述"换进程即复现/消失"方法复现 baseline 行为；在新 profile 首次启动观察 `background-host/` 是否被创建。
 
 ---
 
@@ -229,7 +293,7 @@ window.addEventListener("resize", () => {
 | # | 缺陷 | 归属 | 证据强度 | 状态 |
 |---|---|---|---|---|
 | A1 | 三处 `shell:true` → 空白控制台窗口 | 扩展 | 实测（用户确认消失） | 已本地修 |
-| A2 | `validateProbeResult` 误杀系统 Node → 会话永久 running | 扩展 | **实测复现** | 用户以配置绕过；干净修法待上游 |
+| A2 | `validateProbeResult` 误杀系统 Node → 会话永久 running | 扩展 | **实测复现 + red-on-base** | **已修复**（含正则补强 + 死代码清理） |
 | A3 | idle 30s 短于冷启动 13s | 扩展 | 实测 | 已本地修（10 min） |
 | A4 | `shell:false` 削弱 `where.exe` fallback | 扩展（本调查引入） | 推断 | 已标注，需独立测试 |
 | A5 | `_installRuntime` 无条件覆盖 | 扩展 | 实测（无检查）/ 影响推断 | 未修 |
