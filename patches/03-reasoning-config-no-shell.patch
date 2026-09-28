@@ -1,0 +1,16 @@
+diff --git a/lib/reasoning-config.js b/lib/reasoning-config.js
+index 026d9ee..28918ed 100644
+--- a/lib/reasoning-config.js
++++ b/lib/reasoning-config.js
+@@ -39,7 +39,10 @@ function run(command, args, spawnImpl = spawn, env = undefined) {
+   return new Promise((resolve, reject) => {
+     const child = spawnImpl(command, args, {
+       env: env ? { ...process.env, ...env } : process.env,
+-      shell: process.platform === "win32",
++      // Same console-window reasoning as lib/acp-client.js — no shell, and hide
++      // the window if a shell ends up being used anyway.
++      shell: false,
++      windowsHide: true,
+       stdio: ["ignore", "pipe", "pipe"]
+     });
+     let stdout = "";
