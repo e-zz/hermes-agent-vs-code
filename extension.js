@@ -46,7 +46,35 @@ Requirements:
 - The response must not be empty.`;
 const SOURCE_DIVERGENCE_FEEDBACK = "The source document changed during Diff approval. Do not retry this write in the current turn. In the final response, explain that the update was not applied because the user changed the original document.";
 
-const HERMES_HOME = path.join(os.homedir(), ".hermes");
+// Resolve the Hermes home directory. Hermes itself uses %LOCALAPPDATA%\hermes on
+// Windows and ~/.hermes elsewhere, NOT always ~/.hermes. Hardcoding ~/.hermes made
+// the extension read a stub home: config.yaml, skills/, memories/ and sessions/ all
+// resolved against the wrong directory, so settings written by the extension never
+// reached the Hermes the CLI actually runs with.
+function resolveHermesHome() {
+  if (process.env.HERMES_HOME && process.env.HERMES_HOME.trim()) {
+    return process.env.HERMES_HOME.trim();
+  }
+  const candidates = process.platform === "win32"
+    ? [
+        process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "hermes"),
+        process.env.APPDATA && path.join(process.env.APPDATA, "hermes"),
+        path.join(os.homedir(), ".hermes")
+      ]
+    : [
+        process.env.XDG_DATA_HOME && path.join(process.env.XDG_DATA_HOME, "hermes"),
+        path.join(os.homedir(), ".local", "share", "hermes"),
+        path.join(os.homedir(), ".hermes")
+      ];
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(path.join(candidate, "config.yaml"))) {
+      return candidate;
+    }
+  }
+  return candidates.find(Boolean) || path.join(os.homedir(), ".hermes");
+}
+
+const HERMES_HOME = resolveHermesHome();
 const HERMES_DOC_PATHS = {
   "SOUL.md": path.join(HERMES_HOME, "SOUL.md"),
   "USER.md": path.join(HERMES_HOME, "memories", "USER.md"),
@@ -865,7 +893,8 @@ class HermesSidebarProvider {
         await persistModelReasoningEffort({
           command,
           model: selectedModel,
-          effort: effectiveEffort
+          effort: effectiveEffort,
+          env: { HERMES_HOME }
         });
       } catch (error) {
         vscode.window.showErrorMessage(`Unable to set Hermes reasoning effort: ${error.message}`);
@@ -1892,11 +1921,46 @@ class HermesSidebarProvider {
     }
   }
 
+  /**
+   * Build the argv for the ACP server.
+   *
+   * Reasoning effort is passed as a real CLI argument (`--reasoning <level>`)
+   * instead of being persisted into `agent.reasoning_overrides`. The config-writing
+   * path was unreliable: it required the spawned CLI to resolve the same Hermes home
+   * as the user, and a per-model override keyed by a provider-prefixed model id
+   * (`custom:<provider>:<model>`) did not always match what the runtime looks up.
+   * A launch argument has no such ambiguity — it is resolved for this process only.
+   *
+   * `--reasoning` is a TOP-LEVEL flag, so it must precede the `acp` subcommand:
+   * `hermes --reasoning high acp` (NOT `hermes acp --reasoning high`).
+   */
+  acpArgs() {
+    const args = [];
+    const effort = this.currentReasoningEffort();
+    if (effort) args.push("--reasoning", effort);
+    args.push("acp");
+    return args;
+  }
+
+  /** The most recently persisted effort for the active model, or "" when unset. */
+  currentReasoningEffort() {
+    const allowed = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+    try {
+      const session = this.activeSession(this.activeSessionId);
+      const settings = session?.settings || {};
+      const model = settings.model || vscode.workspace.getConfiguration("hermesAgent").get("model", "");
+      const value = String(settings.reasoningByModel?.[model] || "").trim().toLowerCase();
+      if (allowed.has(value)) return value;
+    } catch { /* fall through to unset */ }
+    return "";
+  }
+
   async startAcpClient(command) {
     const client = new BackgroundClient({
       command,
-      args: ["acp"],
+      args: this.acpArgs(),
       cwd: this.workspaceCwd(),
+      env: { HERMES_HOME },
       storageDir: vscode.Uri.joinPath(this.context.globalStorageUri, "background-host").fsPath,
       extensionRoot: this.context.extensionPath,
       runtimeVersion: this.context.extension?.packageJSON?.version || "0.2.53",
