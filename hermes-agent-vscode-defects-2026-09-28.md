@@ -346,11 +346,15 @@ window.addEventListener("resize", () => {
 |---|---|
 | `:678` / `:1043` 传 `preserveFocus: false`；`:664` 是后台调用、其余四处是用户点击 | **实测**（读码 + 调用点上下文） |
 | `vscode.open(..., preserveFocus:false)` 把键盘焦点给 editor | **文献/API 语义**（VS Code API 文档），非本机实测 |
-| 该路径即用户症状的根因 | **推断**（与复核者一致标注 INFERRED）——「打字时必然触发」未真机复现 |
-| `:635 newGroupLeft` 亦夺焦点 | **推断**（复核者提出，未独立验证） |
+| 该路径即用户症状的根因 | **推断 → 已由用户实测确认（见下）** |
+| `:635 newGroupLeft` 亦夺焦点 | **推断**（复核者提出，未独立验证；本次实测未触发，但仍未证伪） |
 | 打字时输入被劫持到 editor | **实测**（用户报告） |
 
-**可核验点**：读 `extension.js` 的 `openDocumentTab` / `openDocumentUri` / `ensureEditorIsolation`；重载窗口后在 webview prompt 打字并在 editor 侧编辑，观察输入是否仍被劫持。
+**用户实测确认（修复后）**：用户无法重载正在运行的 VS Code 窗口，遂**新开一个窗口**验证，报告「it seems fine now」 —— 输入不再被劫持到 editor。**该结果将「`:664` 后台搬迁是根因」由推断升为实测确认。**
+
+**一处必须记录的方法学保留**：用户验证时旧窗口可能仍在运行修复前的代码（VS Code 每宿主进程只加载一次扩展）。**行尾注**：新窗口加载的是修复后代码，故结论成立；但**「旧窗口是否仍复现」未单独验证**，故未据此排除其他并发因素。若日后在旧窗口观察到复发，属预期行为（内存中仍是旧代码），不构成回归。
+
+**可核验点**：读 `extension.js` 的 `openDocumentTab` / `openDocumentUri` / `ensureEditorIsolation`；`grep -n "preserveFocus" extension.js` 应见 `:668` 传 `true`、`:1042`/`:676` 为参数默认、`:1047`/`:682`/`:692` 透传变量；重载窗口后在 webview prompt 打字并在 editor 侧编辑，观察输入是否仍被劫持。
 
 ---
 
@@ -407,7 +411,7 @@ window.addEventListener("resize", () => {
 | A4 | `shell:false` 削弱 `where.exe` fallback | 扩展（本调查引入） | 推断 | 已标注，需独立测试 |
 | A5 | `_installRuntime` 无条件覆盖 | 扩展 | 实测（无检查）/ 影响推断 | 未修 |
 | A6 | 关闭 tab 时聊天跳顶（`window.scrollTo(0,0)`） | 扩展（前端） | 触发链实测 / reveal→resize 推断 | **已修，用户实测确认位置保持** |
-| A7 | 编辑时焦点被 editor 抢走（后台搬迁 `preserveFocus:false`） | 扩展 | 调用路径实测 / 焦点语义文献值 / 根因推断 | **已修 + red-on-base**（`:635` 新建列分支未覆盖） |
+| A7 | 编辑时焦点被 editor 抢走（后台搬迁 `preserveFocus:false`） | 扩展 | 调用路径实测 / **根因经用户实测确认** | **已修 + red-on-base + 用户实测**（`:635` 新建列分支未覆盖） |
 | A8 | 生成中无法直接下滚（需先上后下） | 扩展（前端） | 机制实测 / 根因**未收敛** | **未修**，三种候选待区分 |
 | B1 | 附件路径被译成 `/mnt/...` | hermes 后端 | **本次实测** | 已修并提交 |
 | B2 | `resume_session` 静默新建 | hermes 后端 | **本次实测** | 已修并提交 |
