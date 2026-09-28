@@ -1,11 +1,12 @@
 # hermes-agent-vscode 全链路缺陷报告（弹窗 / 会话卡死 / 附件路径）
 
 > 来源：用户安装 `eyanlin.hermes-agent-vscode@0.2.53`（上游 https://github.com/eyan-ai/hermes-agent-vs-code ）后，
-> 出现「空白控制台窗口弹出」+「插件会话永久卡在 running」两个症状，逐层排查得到下列缺陷。
+> 逐层排查「空白控制台窗口弹出」「插件会话永久卡在 running」「关闭 editor tab 时聊天跳到顶部」三个症状。
 > 性质：本报告分两部分 —— **A 部分为扩展侧缺陷**（需 fork 或上游修复），**B 部分为 hermes 后端侧缺陷**（已本地修复并提交）。
 > 目的：逐条给出证据与可核验点，供上游或后续维护者复核。
 > 日期：2026-09-28。提交人：Hermes agent（本文件即调查原始记录）。
 > 归因说明：每条均标注 **实测 / 推断 / 推测**。`shell:false` 相关两条见 §A4 caveat。
+> 修订：A6（关闭 tab 跳顶）为后续新增，与本报告首版同日。
 
 ---
 
@@ -177,6 +178,50 @@ raises RequestError.invalid_params : True
 
 ---
 
+## A6 — 关闭 editor tab 时聊天跳到顶部：`resize` 处理器里一句无关的 `window.scrollTo(0, 0)`
+
+**现象（用户报告）**：关闭任意一个 editor tab 时，聊天视图**跳到顶部**，丢失阅读位置。
+
+**完整触发链（实测，逐环读出）**：
+
+```
+关闭 editor tab
+  → vscode.window.tabGroups.onDidChangeTabs      extension.js:215
+  → provider.ensureEditorIsolation()              extension.js:639
+  → panel.reveal(targetAgentColumn, true)         ← 强制重排 webview
+  → webview 触发 resize 事件
+  → window.addEventListener("resize", ...)        media/main.js:678
+  → window.scrollTo(0, 0)                         media/main.js:679   ← 缺陷点
+```
+
+**代码证据（缺陷点）**：`media/main.js` 的 resize 处理器里，第一行是：
+
+```js
+window.addEventListener("resize", () => {
+  window.scrollTo(0, 0);       // ← 与「重算 composer 内边距」毫无关系
+  positionSettingsPopover();
+  const el = document.querySelector(".scroll");
+  syncScrollPadding(el);
+  ...
+});
+```
+
+该处理器的职责是**在面板尺寸变化后重算 composer 高度对应的底部留白**（见其上方的 `watchComposerSize` / `syncScrollPadding` 注释）。`window.scrollTo(0, 0)` 不服务于该职责，是遗留语句。
+
+**为什么 `panel.reveal` 会触发 resize（推断）**：`ensureEditorIsolation` 会把 Hermes 面板 `reveal` 到目标列以维持「编辑器/Agent 分栏隔离」。`reveal` 导致 webview 重新布局 ⇒ resize。**本条为推断** —— 未直接抓取 VS Code 内部事件流；但触发链的每一环（`onDidChangeTabs` 绑 `ensureEditorIsolation`、其内部调 `panel.reveal`、webview 内存在无条件 `scrollTo(0,0)`）均为实测读出。
+
+**一处需要澄清的细节（实测）**：真正的滚动容器是 `.scroll`（`styles.css:111`，`overflow-y: auto`），**不是 `window`**。因此 `window.scrollTo(0, 0)` 本身并不重置对话的 `scrollTop`。症状能表现为「跳到顶部」，说明另有环节被 resize 连带触发（例如面板重排后 webview 自身滚动位置被重置）。**缺陷语句被移除后该症状即失去触发点 —— 但「webview 重排是否还会自行归零」未单独隔离验证，此点标注为待观察。**
+
+**修法**：删除该行。保留处理器其余职责。
+
+**实测（修复后）**：`node --check media/main.js` 通过；`window.scrollTo` 归零（唯一命中为说明性注释）；处理器仍保留 `syncScrollPadding` / `positionOpenPicker` / 流式期间贴底逻辑。
+
+**可核验点**：读 `media/main.js` 的 resize 处理器（约 `:678`）；关闭一个 editor tab 观察聊天位置是否保持；`grep -n "window.scrollTo" media/main.js` 应只命中注释。
+
+**与 A2 的关系**：两者都因 `ensureEditorIsolation` 的 `panel.reveal` 而起，但**是独立缺陷** —— A2 是 host 起不来（后端进程层），A6 是纯前端滚动位置。
+
+---
+
 # 汇总
 
 | # | 缺陷 | 归属 | 证据强度 | 状态 |
@@ -186,6 +231,7 @@ raises RequestError.invalid_params : True
 | A3 | idle 30s 短于冷启动 13s | 扩展 | 实测 | 已本地修（10 min） |
 | A4 | `shell:false` 削弱 `where.exe` fallback | 扩展（本调查引入） | 推断 | 已标注，需独立测试 |
 | A5 | `_installRuntime` 无条件覆盖 | 扩展 | 实测（无检查）/ 影响推断 | 未修 |
+| A6 | 关闭 tab 时聊天跳顶（`window.scrollTo(0,0)`） | 扩展（前端） | 触发链实测 / reveal→resize 推断 | 已修（待用户实测） |
 | B1 | 附件路径被译成 `/mnt/...` | hermes 后端 | **本次实测** | 已修并提交 |
 | B2 | `resume_session` 静默新建 | hermes 后端 | **本次实测** | 已修并提交 |
 
