@@ -216,6 +216,8 @@ window.addEventListener("resize", () => {
 
 **实测（修复后）**：`node --check media/main.js` 通过；`window.scrollTo` 归零（唯一命中为说明性注释）；处理器仍保留 `syncScrollPadding` / `positionOpenPicker` / 流式期间贴底逻辑。
 
+**用户实测确认**：重载窗口后关闭 editor tab，**聊天位置保持**（原话 "now it stays when I close an editor tab"）。此前标注的「webview 重排是否还会自行归零」这一待观察点由该实测结果关闭。
+
 **可核验点**：读 `media/main.js` 的 resize 处理器（约 `:678`）；关闭一个 editor tab 观察聊天位置是否保持；`grep -n "window.scrollTo" media/main.js` 应只命中注释。
 
 **与 A2 的关系**：两者都因 `ensureEditorIsolation` 的 `panel.reveal` 而起，但**是独立缺陷** —— A2 是 host 起不来（后端进程层），A6 是纯前端滚动位置。
@@ -231,7 +233,7 @@ window.addEventListener("resize", () => {
 | A3 | idle 30s 短于冷启动 13s | 扩展 | 实测 | 已本地修（10 min） |
 | A4 | `shell:false` 削弱 `where.exe` fallback | 扩展（本调查引入） | 推断 | 已标注，需独立测试 |
 | A5 | `_installRuntime` 无条件覆盖 | 扩展 | 实测（无检查）/ 影响推断 | 未修 |
-| A6 | 关闭 tab 时聊天跳顶（`window.scrollTo(0,0)`） | 扩展（前端） | 触发链实测 / reveal→resize 推断 | 已修（待用户实测） |
+| A6 | 关闭 tab 时聊天跳顶（`window.scrollTo(0,0)`） | 扩展（前端） | 触发链实测 / reveal→resize 推断 | **已修，用户实测确认位置保持** |
 | B1 | 附件路径被译成 `/mnt/...` | hermes 后端 | **本次实测** | 已修并提交 |
 | B2 | `resume_session` 静默新建 | hermes 后端 | **本次实测** | 已修并提交 |
 
