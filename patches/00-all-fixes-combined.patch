@@ -1,3 +1,93 @@
+diff --git a/background/host.js b/background/host.js
+index eabdb3c..c67118d 100644
+--- a/background/host.js
++++ b/background/host.js
+@@ -18,8 +18,16 @@ const {
+ const TERMINAL_STATUSES = new Set(["done", "failed", "interrupted"]);
+ const RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+ 
++// Idle exit threshold. Upstream ships 30s, which is shorter than the ACP backend's
++// own cold start (measured ~13s: MCP server handshakes + ~62 plugin registrations),
++// so any pause longer than half a minute kills the host and the next prompt pays a
++// full backend restart. 10 minutes keeps the anti-orphan intent (an abandoned host
++// still reaps itself, and _hasActiveWork() still blocks exit while a task runs)
++// while making the restart rare instead of routine.
++const IDLE_EXIT_MS = 10 * 60 * 1000;
++
+ class BackgroundHost {
+-  constructor({ storageDir, token, socketPath, instanceId, idleMs = 30_000, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
++  constructor({ storageDir, token, socketPath, instanceId, idleMs = IDLE_EXIT_MS, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
+     this.storageDir = storageDir;
+     this.token = token;
+     this.instanceId = instanceId || crypto.randomUUID();
+@@ -346,7 +354,24 @@ class BackgroundHost {
+       handlers: {
+         onSessionUpdate: (update, sessionId) => this._onSessionUpdate(update, sessionId),
+         onPermissionRequest: request => this._onPermissionRequest(client, request),
+-        onStderr: line => this._broadcast({ type: "acp.stderr", line }),
++        onStderr: line => {
++          this._broadcast({ type: "acp.stderr", line });
++          // The extension filters ACP stderr down to lines matching
++          // /\[ERROR\]|\[CRITICAL\]|Traceback|^Error:|FATAL/ before showing
++          // anything, so a handshake failure whose message lacks one of those
++          // markers disappears entirely and the turn is reported as a generic
++          // "could not complete the request". Persist the raw stream next to
++          // the host state so the real cause is always recoverable.
++          try {
++            if (!this.acpStderrLog) {
++              this.acpStderrLog = require("path").join(this.storageDir, "acp-stderr.log");
++            }
++            require("fs").appendFileSync(
++              this.acpStderrLog,
++              `${new Date().toISOString()} ${line}\n`
++            );
++          } catch { /* diagnostics must never break the turn */ }
++        },
+         onError: error => this._broadcast({ type: "acp.error", message: error.message }),
+         onExit: code => {
+           this._broadcast({ type: "acp.exit", code });
+@@ -389,7 +414,9 @@ class BackgroundHost {
+     const child = require("child_process").spawn(input.command, input.args || [], {
+       cwd: input.cwd,
+       env: { ...process.env, ...(input.env || {}) },
+-      shell: process.platform === "win32",
++      // See lib/acp-client.js: a shell on Windows opens a visible console window.
++      shell: false,
++      windowsHide: true,
+       stdio: ["pipe", "pipe", "pipe"]
+     });
+     this.cliProcesses.set(run.runId, { child, run });
+@@ -536,6 +563,30 @@ async function main() {
+   const socketPath = process.env.HERMES_BACKGROUND_SOCKET;
+   const instanceId = process.env.HERMES_BACKGROUND_INSTANCE;
+   if (!storageDir || !token || !socketPath || !instanceId) throw new Error("Missing background host environment");
++
++  // The extension spawns this host detached with stdio "ignore" (so no console
++  // window appears on Windows), which means anything written to stdout/stderr
++  // vanishes — a startup failure would be invisible. Redirect our own output to
++  // a log file here, inside the child, where we can still decide where it goes
++  // without changing how we were spawned.
++  try {
++    const fs = require("fs");
++    const pathMod = require("path");
++    const logPath = pathMod.join(storageDir, "host.log");
++    fs.mkdirSync(storageDir, { recursive: true });
++    const fd = fs.openSync(logPath, "a");
++    fs.writeSync(fd, `\n===== host start ${new Date().toISOString()} pid=${process.pid} =====\n`);
++    const toLog = (chunk) => { try { fs.writeSync(fd, chunk); } catch { /* best effort */ } };
++    process.stderr.write = (chunk) => { toLog(chunk); return true; };
++    process.on("uncaughtException", error => {
++      toLog(`${error && error.stack ? error.stack : error}\n`);
++      process.exit(1);
++    });
++    process.on("unhandledRejection", reason => {
++      toLog(`unhandledRejection: ${reason && reason.stack ? reason.stack : reason}\n`);
++    });
++  } catch { /* logging is best-effort; never block startup */ }
++
+   const host = new BackgroundHost({ storageDir, token, socketPath, instanceId });
+   await host.listen();
+   process.on("SIGTERM", () => host.close({ terminateAcp: true }).finally(() => process.exit(0)));
 diff --git a/extension.js b/extension.js
 index 4febbdc..2ef24e6 100644
 --- a/extension.js
@@ -280,14 +370,29 @@ index 4febbdc..2ef24e6 100644
        this.permissionSessionGrants.clear();
        this.permissionBatchState.clear();
 diff --git a/lib/acp-client.js b/lib/acp-client.js
-index e7be279..1ee0ab3 100644
+index e7be279..2f3337a 100644
 --- a/lib/acp-client.js
 +++ b/lib/acp-client.js
-@@ -64,7 +64,12 @@ class AcpClient {
+@@ -36,10 +36,11 @@ class AcpClient {
+    * @param {(err: Error) => void} [options.handlers.onError]
+    * @param {(line: string) => void} [options.handlers.onStderr]
+    */
+-  constructor({ command, args, cwd, handlers = {} }) {
++  constructor({ command, args, cwd, env, handlers = {} }) {
+     this.command = command;
+     this.args = args || ["acp"];
+     this.cwd = cwd;
++    this.env = env;
+     this.handlers = handlers;
+     this.proc = null;
+     this.nextId = 1;
+@@ -63,8 +64,13 @@ class AcpClient {
+       try {
          child = spawn(this.command, this.args, {
            cwd: this.cwd,
-           env: { ...process.env, HERMES_ACCEPT_HOOKS: "1" },
+-          env: { ...process.env, HERMES_ACCEPT_HOOKS: "1" },
 -          shell: process.platform === "win32",
++          env: { ...process.env, HERMES_ACCEPT_HOOKS: "1", ...(this.env || {}) },
 +          // No shell: spawning through cmd.exe opens a visible console window on
 +          // Windows, and the command here is an executable (hermes.exe) that Node
 +          // resolves from PATH on its own. windowsHide is belt-and-braces for the
@@ -297,83 +402,6 @@ index e7be279..1ee0ab3 100644
            stdio: ["pipe", "pipe", "pipe"]
          });
        } catch (err) {
-diff --git a/lib/reasoning-config.js b/lib/reasoning-config.js
-index 46e837a..5f9656e 100644
---- a/lib/reasoning-config.js
-+++ b/lib/reasoning-config.js
-@@ -39,7 +39,10 @@ function run(command, args, spawnImpl = spawn) {
-   return new Promise((resolve, reject) => {
-     const child = spawnImpl(command, args, {
-       env: process.env,
--      shell: process.platform === "win32",
-+      // Same console-window reasoning as lib/acp-client.js — no shell, and hide
-+      // the window if a shell ends up being used anyway.
-+      shell: false,
-+      windowsHide: true,
-       stdio: ["ignore", "pipe", "pipe"]
-     });
-     let stdout = "";
-diff --git a/background/host.js b/background/host.js
-index eabdb3c..b9d4593 100644
---- a/background/host.js
-+++ b/background/host.js
-@@ -18,8 +18,16 @@ const {
- const TERMINAL_STATUSES = new Set(["done", "failed", "interrupted"]);
- const RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
- 
-+// Idle exit threshold. Upstream ships 30s, which is shorter than the ACP backend's
-+// own cold start (measured ~13s: MCP server handshakes + ~62 plugin registrations),
-+// so any pause longer than half a minute kills the host and the next prompt pays a
-+// full backend restart. 10 minutes keeps the anti-orphan intent (an abandoned host
-+// still reaps itself, and _hasActiveWork() still blocks exit while a task runs)
-+// while making the restart rare instead of routine.
-+const IDLE_EXIT_MS = 10 * 60 * 1000;
-+
- class BackgroundHost {
--  constructor({ storageDir, token, socketPath, instanceId, idleMs = 30_000, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
-+  constructor({ storageDir, token, socketPath, instanceId, idleMs = IDLE_EXIT_MS, cliStopGraceMs = 1000, writeState = atomicWriteJson }) {
-     this.storageDir = storageDir;
-     this.token = token;
-     this.instanceId = instanceId || crypto.randomUUID();
-@@ -389,7 +397,9 @@ class BackgroundHost {
-     const child = require("child_process").spawn(input.command, input.args || [], {
-       cwd: input.cwd,
-       env: { ...process.env, ...(input.env || {}) },
--      shell: process.platform === "win32",
-+      // See lib/acp-client.js: a shell on Windows opens a visible console window.
-+      shell: false,
-+      windowsHide: true,
-       stdio: ["pipe", "pipe", "pipe"]
-     });
-     this.cliProcesses.set(run.runId, { child, run });
-diff --git a/lib/background-client.js b/lib/background-client.js
-index 7474379..69c998c 100644
---- a/lib/background-client.js
-+++ b/lib/background-client.js
-@@ -19,6 +19,7 @@ class BackgroundClient {
-     command,
-     args = ["acp"],
-     cwd,
-+    env,
-     handlers = {},
-     storageDir,
-     extensionRoot,
-@@ -30,6 +31,7 @@ class BackgroundClient {
-     this.command = command;
-     this.args = args;
-     this.cwd = cwd;
-+    this.env = env;
-     this.handlers = handlers;
-     this.storageDir = storageDir;
-     this.extensionRoot = extensionRoot;
-@@ -220,6 +222,7 @@ class BackgroundClient {
-     };
-     const env = {
-       ...process.env,
-+      ...(this.env || {}),
-       HERMES_BACKGROUND_STORAGE: this.storageDir,
-       HERMES_BACKGROUND_TOKEN: token,
-       HERMES_BACKGROUND_SOCKET: socketPath,
 diff --git a/lib/acp-render.js b/lib/acp-render.js
 index 3d7ff44..b55474a 100644
 --- a/lib/acp-render.js
@@ -436,3 +464,141 @@ index 3d7ff44..b55474a 100644
  }
  
  module.exports = { ACTION_LABELS, createAcpRenderer, naturalTitle, normalizeHermesEvent };
+diff --git a/lib/background-client.js b/lib/background-client.js
+index 7474379..69c998c 100644
+--- a/lib/background-client.js
++++ b/lib/background-client.js
+@@ -19,6 +19,7 @@ class BackgroundClient {
+     command,
+     args = ["acp"],
+     cwd,
++    env,
+     handlers = {},
+     storageDir,
+     extensionRoot,
+@@ -30,6 +31,7 @@ class BackgroundClient {
+     this.command = command;
+     this.args = args;
+     this.cwd = cwd;
++    this.env = env;
+     this.handlers = handlers;
+     this.storageDir = storageDir;
+     this.extensionRoot = extensionRoot;
+@@ -220,6 +222,7 @@ class BackgroundClient {
+     };
+     const env = {
+       ...process.env,
++      ...(this.env || {}),
+       HERMES_BACKGROUND_STORAGE: this.storageDir,
+       HERMES_BACKGROUND_TOKEN: token,
+       HERMES_BACKGROUND_SOCKET: socketPath,
+diff --git a/lib/reasoning-config.js b/lib/reasoning-config.js
+index 46e837a..28918ed 100644
+--- a/lib/reasoning-config.js
++++ b/lib/reasoning-config.js
+@@ -35,11 +35,14 @@ function reasoningConfigCommands(model, effort, current = {}) {
+   };
+ }
+ 
+-function run(command, args, spawnImpl = spawn) {
++function run(command, args, spawnImpl = spawn, env = undefined) {
+   return new Promise((resolve, reject) => {
+     const child = spawnImpl(command, args, {
+-      env: process.env,
+-      shell: process.platform === "win32",
++      env: env ? { ...process.env, ...env } : process.env,
++      // Same console-window reasoning as lib/acp-client.js — no shell, and hide
++      // the window if a shell ends up being used anyway.
++      shell: false,
++      windowsHide: true,
+       stdio: ["ignore", "pipe", "pipe"]
+     });
+     let stdout = "";
+@@ -54,14 +57,14 @@ function run(command, args, spawnImpl = spawn) {
+   });
+ }
+ 
+-async function persistModelReasoningEffort({ command, model, effort, spawnImpl = spawn }) {
++async function persistModelReasoningEffort({ command, model, effort, spawnImpl = spawn, env = undefined }) {
+   const executable = String(command || "").trim();
+   if (!executable) throw new Error("Hermes CLI is not configured");
+   const getArgs = ["config", "get", "agent.reasoning_overrides", "--json"];
+-  const raw = await run(executable, getArgs, spawnImpl);
++  const raw = await run(executable, getArgs, spawnImpl, env);
+   const merged = mergeReasoningOverrides(raw, model, effort);
+   const setArgs = ["config", "set", "agent.reasoning_overrides", JSON.stringify(merged)];
+-  await run(executable, setArgs, spawnImpl);
++  await run(executable, setArgs, spawnImpl, env);
+   return merged;
+ }
+ 
+diff --git a/lib/node-runtime.js b/lib/node-runtime.js
+index 3504901..3aad645 100644
+--- a/lib/node-runtime.js
++++ b/lib/node-runtime.js
+@@ -6,7 +6,7 @@ const path = require("path");
+ const { spawn } = require("child_process");
+ 
+ const DEFAULT_TIMEOUT_MS = 3000;
+-const APPLICATION_RUNTIME_PATTERN = /(?:code helper|visual studio code|electron)/i;
++const APPLICATION_RUNTIME_PATTERN = /(?:code helper|visual studio code|electron|(?:^|[\\/])code(?: - insiders)?\.exe$)/i;
+ 
+ class NodeRuntimeError extends Error {
+   constructor(message, { code = "NODE_RUNTIME_ERROR", failures = [] } = {}) {
+@@ -24,12 +24,11 @@ function normalizedPath(value) {
+     : resolved;
+ }
+ 
+-function samePath(left, right) {
+-  if (!left || !right) return false;
+-  return normalizedPath(left) === normalizedPath(right);
+-}
+-
+ function validateProbeResult(runtime, currentExecPath = process.execPath) {
++  // `currentExecPath` is retained for backwards compatibility with callers that
++  // pass it positionally; it is no longer used to disqualify a candidate. See the
++  // note at the end of this function for why identity is not disqualifying.
++  void currentExecPath;
+   if (!runtime || !/^\d+\.\d+(?:\.\d+)?/.test(String(runtime.nodeVersion || ""))) {
+     throw new Error("Executable did not report a valid Node.js version");
+   }
+@@ -44,9 +43,17 @@ function validateProbeResult(runtime, currentExecPath = process.execPath) {
+   if (APPLICATION_RUNTIME_PATTERN.test(executablePath) || APPLICATION_RUNTIME_PATTERN.test(realPath)) {
+     throw new Error("VS Code or Electron executables cannot own the Hermes background host");
+   }
+-  if (samePath(realPath, currentExecPath) || samePath(executablePath, currentExecPath)) {
+-    throw new Error("The extension host executable cannot own the Hermes background host");
+-  }
++  // NOTE: a check that rejected any candidate whose path equals the current
++  // process's execPath used to live here. It was removed because it could only
++  // ever fire on a genuine standalone Node.js runtime: VS Code's Code.exe and
++  // Electron binaries never reach this point at all (Code.exe emits no parseable
++  // probe response, and electronVersion is rejected above — probeNodeRuntime also
++  // deletes ELECTRON_RUN_AS_NODE so an Electron binary cannot impersonate Node).
++  // When VS Code's extension host itself is launched with system Node, that Node
++  // *is* the correct background host, and the old check rejected it, producing
++  // "A validated standalone Node.js runtime is required for the Hermes background
++  // host" with no valid candidate left. The probe-based checks above already
++  // establish the candidate is a real Node runtime, so identity is not disqualifying.
+   return runtime;
+ }
+ 
+diff --git a/media/main.js b/media/main.js
+index 797da56..2e38558 100644
+--- a/media/main.js
++++ b/media/main.js
+@@ -675,8 +675,13 @@ function watchComposerSize() {
+   composerSizeObserver.observe(composer);
+ }
+ // Window/webview resize changes the composer size too — keep padding in sync.
++// NOTE: this fires whenever the panel is re-laid-out, including
++// ensureEditorIsolation()'s panel.reveal() on every tab change/close. Do NOT
++// scroll anything absolutely here: a `window.scrollTo(0, 0)` used to live on
++// this line and made the chat jump to the top every time an editor tab closed.
++// The conversation lives in `.scroll` (the only scroller), so the block below
++// only nudges it while output is streaming and the user is already at bottom.
+ window.addEventListener("resize", () => {
+-  window.scrollTo(0, 0);
+   positionSettingsPopover();
+   const el = document.querySelector(".scroll");
+   syncScrollPadding(el);
