@@ -354,7 +354,24 @@ class BackgroundHost {
       handlers: {
         onSessionUpdate: (update, sessionId) => this._onSessionUpdate(update, sessionId),
         onPermissionRequest: request => this._onPermissionRequest(client, request),
-        onStderr: line => this._broadcast({ type: "acp.stderr", line }),
+        onStderr: line => {
+          this._broadcast({ type: "acp.stderr", line });
+          // The extension filters ACP stderr down to lines matching
+          // /\[ERROR\]|\[CRITICAL\]|Traceback|^Error:|FATAL/ before showing
+          // anything, so a handshake failure whose message lacks one of those
+          // markers disappears entirely and the turn is reported as a generic
+          // "could not complete the request". Persist the raw stream next to
+          // the host state so the real cause is always recoverable.
+          try {
+            if (!this.acpStderrLog) {
+              this.acpStderrLog = require("path").join(this.storageDir, "acp-stderr.log");
+            }
+            require("fs").appendFileSync(
+              this.acpStderrLog,
+              `${new Date().toISOString()} ${line}\n`
+            );
+          } catch { /* diagnostics must never break the turn */ }
+        },
         onError: error => this._broadcast({ type: "acp.error", message: error.message }),
         onExit: code => {
           this._broadcast({ type: "acp.exit", code });
@@ -546,6 +563,30 @@ async function main() {
   const socketPath = process.env.HERMES_BACKGROUND_SOCKET;
   const instanceId = process.env.HERMES_BACKGROUND_INSTANCE;
   if (!storageDir || !token || !socketPath || !instanceId) throw new Error("Missing background host environment");
+
+  // The extension spawns this host detached with stdio "ignore" (so no console
+  // window appears on Windows), which means anything written to stdout/stderr
+  // vanishes — a startup failure would be invisible. Redirect our own output to
+  // a log file here, inside the child, where we can still decide where it goes
+  // without changing how we were spawned.
+  try {
+    const fs = require("fs");
+    const pathMod = require("path");
+    const logPath = pathMod.join(storageDir, "host.log");
+    fs.mkdirSync(storageDir, { recursive: true });
+    const fd = fs.openSync(logPath, "a");
+    fs.writeSync(fd, `\n===== host start ${new Date().toISOString()} pid=${process.pid} =====\n`);
+    const toLog = (chunk) => { try { fs.writeSync(fd, chunk); } catch { /* best effort */ } };
+    process.stderr.write = (chunk) => { toLog(chunk); return true; };
+    process.on("uncaughtException", error => {
+      toLog(`${error && error.stack ? error.stack : error}\n`);
+      process.exit(1);
+    });
+    process.on("unhandledRejection", reason => {
+      toLog(`unhandledRejection: ${reason && reason.stack ? reason.stack : reason}\n`);
+    });
+  } catch { /* logging is best-effort; never block startup */ }
+
   const host = new BackgroundHost({ storageDir, token, socketPath, instanceId });
   await host.listen();
   process.on("SIGTERM", () => host.close({ terminateAcp: true }).finally(() => process.exit(0)));

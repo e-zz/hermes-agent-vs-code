@@ -675,8 +675,13 @@ function watchComposerSize() {
   composerSizeObserver.observe(composer);
 }
 // Window/webview resize changes the composer size too — keep padding in sync.
+// NOTE: this fires whenever the panel is re-laid-out, including
+// ensureEditorIsolation()'s panel.reveal() on every tab change/close. Do NOT
+// scroll anything absolutely here: a `window.scrollTo(0, 0)` used to live on
+// this line and made the chat jump to the top every time an editor tab closed.
+// The conversation lives in `.scroll` (the only scroller), so the block below
+// only nudges it while output is streaming and the user is already at bottom.
 window.addEventListener("resize", () => {
-  window.scrollTo(0, 0);
   positionSettingsPopover();
   const el = document.querySelector(".scroll");
   syncScrollPadding(el);
