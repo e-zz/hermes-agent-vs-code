@@ -12,6 +12,7 @@ const { buildCommandCatalog, DEFAULT_ACP_COMMANDS, parseQuickCommands, resolveCo
 const { textOf } = require("./lib/acp-text");
 const { PromptQueue, resolveSubmission } = require("./lib/prompt-queue");
 const { SessionCancellationBarrier } = require("./lib/session-cancellation-barrier");
+const { requestSessionRoute } = require("./lib/session-route-recovery");
 const { forkAcpSession, installAcpSessionReplacement } = require("./lib/acp-session-handoff");
 const { buildGeneratedDocumentCandidates } = require("./lib/generated-document");
 const { buildHermesPromptBlocks, mergeHermesSessions } = require("./lib/hermes-sessions");
@@ -1211,8 +1212,10 @@ class HermesSidebarProvider {
   }
 
   applyAcpSessionState(session, acpSessionId, models, configOptions) {
-    this.acpSessions.set(session.id, acpSessionId);
-    session.acpSessionId = acpSessionId;
+    if (acpSessionId) {
+      this.acpSessions.set(session.id, acpSessionId);
+      session.acpSessionId = acpSessionId;
+    }
     const runtimeModels = normalizeModelState(models);
     if (runtimeModels.options.length) session.modelState = runtimeModels;
     session.reasoningEffortSupported = true;
@@ -1247,30 +1250,78 @@ class HermesSidebarProvider {
     return this._sessionRefreshPromise;
   }
 
-  async ensureMappedAcpSession(client, session) {
-    const mapped = this.acpSessions.get(session.id);
-    if (mapped) return mapped;
-
-    const persisted = String(session.acpSessionId || "").trim();
-    if (persisted && !this.retiredAcpSessions.has(persisted)) {
-      this.acpSessions.set(session.id, persisted);
-      try {
-        const resumed = await client.request("session/resume", {
-          cwd: this.workspaceCwd(),
-          sessionId: persisted,
-          mcpServers: []
+  /**
+   * A persisted ACP id whose resume fails is recovered ONLY by asking the
+   * user to name the provider/model explicitly (QuickPick) and retrying ONCE
+   * with `_meta.hermesModelId`. Cancelling keeps the session id untouched and
+   * blocks the turn — no replacement session, no CLI. The QuickPick lists only
+   * named routes (`custom:<provider>:<model>`) so two configs for the same
+   * model with different credentials stay distinguishable.
+   */
+  async requestSessionWithRouteChoice(client, method, params, session) {
+    const result = await requestSessionRoute({
+      request: (name, payload) => client.request(name, payload),
+      method, params,
+      chooseRoute: async () => {
+        const options = this.modelStateForSession(session).options || [];
+        const items = options.filter(option => !option.unavailable && /^custom:[^:]+:.+$/.test(option.id))
+          .map(option => ({label: option.name || option.id, description: option.id, modelId: option.id}));
+        if (!items.length) {
+          vscode.window.showErrorMessage("No named Hermes route is available. Configure a named provider before resuming this session.");
+          return undefined;
+        }
+        const selected = await vscode.window.showQuickPick(items, {
+          title: "Choose the provider and model for this session",
+          placeHolder: "An explicit choice is required. Cancel keeps the existing session unchanged.",
+          ignoreFocusOut: true
         });
-        this.applyAcpSessionState(session, persisted, resumed?.models, resumed?.configOptions);
-        return persisted;
-      } catch {
-        if (this.acpSessions.get(session.id) === persisted) this.acpSessions.delete(session.id);
-        session.acpSessionId = "";
+        return selected?.modelId;
       }
-    }
+    });
+    if (result.selectedModel) session.settings = {...(session.settings || {}), model: result.selectedModel};
+    return result.response;
+  }
 
-    const created = await client.request("session/new", { cwd: this.workspaceCwd(), mcpServers: [], skip_memory: true });
+  /**
+   * Ensure the UI session holds a live ACP session id for the current turn.
+   *
+   * A persisted (or already-mapped) id is ALWAYS resumed here, before any new
+   * work: resume is the only request that is safe for an id the backend may
+   * already hold, and the backend replays history for resident sessions. The
+   * old early-return ("mapped id needs nothing") let a stale mapping skip
+   * resume, so a route the backend refused would never be re-confirmed.
+   *
+   * A resume failure is NOT an authorization to replace the session: the old
+   * catch cleared `session.acpSessionId` and issued `session/new`, which
+   * orphaned the UI's history. Now a failed recovery asks the user for an
+   * explicit route (see requestSessionWithRouteChoice) and otherwise throws
+   * HERMES_SESSION_ROUTE_BLOCKED, leaving the id in place.
+   */
+  async ensureMappedAcpSession(client, session) {
+    const persisted = String(this.acpSessions.get(session.id) || session.acpSessionId || "").trim();
+    if (persisted && !this.retiredAcpSessions.has(persisted)) {
+      // Seed the in-memory registry up-front so the id stays mapped through a
+      // declined recovery too; only a successful resume applies fresh model
+      // state, and a block error leaves both the Map and the session alone.
+      this.acpSessions.set(session.id, persisted);
+      session.acpSessionId = persisted;
+      const resumed = await this.requestSessionWithRouteChoice(client, "session/resume", {
+        cwd: this.workspaceCwd(), sessionId: persisted, mcpServers: []
+      }, session);
+      this.applyAcpSessionState(session, persisted, resumed?.models, resumed?.configOptions);
+      return persisted;
+    }
+    // No persisted id: creating a fresh session IS the user's explicit choice
+    // (they opened or picked this session), so no route prompt is needed.
+    const created = await this.requestSessionWithRouteChoice(client, "session/new", {
+      cwd: this.workspaceCwd(), mcpServers: [], skip_memory: true
+    }, session);
     const acpSessionId = String(created?.sessionId || "").trim();
-    if (!acpSessionId) throw new Error("Hermes did not return an ACP session");
+    if (!acpSessionId) {
+      const error = new Error("Hermes did not return an ACP session.");
+      error.code = "HERMES_SESSION_ROUTE_BLOCKED";
+      throw error;
+    }
     this.applyAcpSessionState(session, acpSessionId, created.models, created.configOptions);
     return acpSessionId;
   }
@@ -1585,6 +1636,18 @@ class HermesSidebarProvider {
         if (assistantMessage.status === "stopped" || isTurnCancelled(err)) return;
         if (this.isNodeRuntimeError(err)) {
           await this.failNodeRuntimeTurn(assistantMessage, err);
+          return;
+        }
+        // A route that failed to recover needs an explicit user choice, not a
+        // substitution: falling back to the CLI (or to a fresh ACP session)
+        // would orphan the persisted history. End the turn as failed; the
+        // original session id stays mapped and the next turn re-asks.
+        if (err?.code === "HERMES_SESSION_ROUTE_BLOCKED") {
+          assistantMessage.status = "failed";
+          assistantMessage.finishedAt = Date.now();
+          assistantMessage.thinking.push({ kind: "error", title: "Session route needs confirmation", text: err.message, finalized: true });
+          await this.saveSessions();
+          this.postState();
           return;
         }
         // ACP failed (missing extra, protocol error, …) — surface once, then
@@ -3819,4 +3882,4 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-module.exports = { activate, deactivate };
+module.exports = { activate, deactivate, HermesSidebarProvider };
