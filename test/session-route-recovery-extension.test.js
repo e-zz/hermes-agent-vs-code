@@ -408,6 +408,31 @@ const { HermesSidebarProvider } = require(path.join(repoRoot, "extension.js"));
     assert.equal(session.settings?.model, "custom:cpa:gpt-6.1-sol");
   }
 
+  // Scenario 8: a reply already in flight arrives after /stop. Do not apply its
+  // confirmed route to UI settings; the server-side dispatched request is not undone.
+  {
+    const provider = makeProvider();
+    const session = provider.sessions[0];
+    const before = {...session.settings};
+    const lifecycle = {cancelled: false};
+    provider.activeTurns.set(session.id, {lifecycle, assistantMessage: {status: "running"}});
+    quickPickParkActive = false;
+    quickPickChoice = "custom:cpa:gpt-6.1-sol";
+    let attempts = 0;
+    const lateClient = {request: async (method, params) => {
+      attempts++;
+      if (!params._meta) throw new Error("route ambiguous");
+      lifecycle.cancelled = true;
+      return {models: {currentModelId: params._meta.hermesModelId}};
+    }};
+    await assert.rejects(provider.requestSessionWithRouteChoice(lateClient, "session/resume",
+      {sessionId: session.acpSessionId, cwd: ".", mcpServers: []}, session),
+      error => error.code === "HERMES_TURN_CANCELLED");
+    assert.equal(attempts, 2);
+    assert.deepEqual(session.settings, before);
+    assert.equal(session.acpSessionId, "persisted-old-id");
+  }
+
   // Wiring (F1): this test must be part of the dedicated recovery gate and of
   // the standard chains, so the package.json and this file stay in sync.
   {
@@ -452,5 +477,5 @@ const { HermesSidebarProvider } = require(path.join(repoRoot, "extension.js"));
   }
   process.once("beforeExit", exitFlush);
 
-  console.log("extension route recovery wiring: 7 scenarios passed");
+  console.log("extension route recovery wiring: 8 scenarios passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });

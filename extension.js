@@ -1268,10 +1268,8 @@ class HermesSidebarProvider {
     const isCancelled = () => Boolean(turn?.lifecycle?.cancelled) ||
       Boolean(turn?.assistantMessage && turn.assistantMessage.status === "stopped");
     const result = await requestSessionRoute({
-      request: async (name, payload) => {
-        if (name === "session/resume" && isCancelled()) throw new TurnCancelledError();
-        return client.request(name, payload);
-      },
+      request: (name, payload) => client.request(name, payload),
+      isCancelled,
       method, params,
       chooseRoute: async () => {
         if (isCancelled()) return undefined;

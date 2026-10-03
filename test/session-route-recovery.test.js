@@ -63,5 +63,20 @@ const pkg = require("../package.json");
     assert.ok(pkg.scripts["test:unit"].includes(path.join("test", "session-route-recovery.test.js").split(path.sep).join("/")), "test:unit must keep running this test");
   }
 
-  console.log("session route recovery: 4 scenarios passed");
+  let cancelled = false;
+  let lateCalls = 0;
+  await assert.rejects(requestSessionRoute({
+    request: async (method, params) => {
+      lateCalls++;
+      if (!params._meta) throw new Error("ambiguous");
+      cancelled = true; // /stop lands after dispatch, before the reply is handled.
+      return {models: {currentModelId: "custom:baqis-fast:qwen-test"}};
+    },
+    method: "session/resume", params: {sessionId: "old"},
+    chooseRoute: async () => "custom:baqis-fast:qwen-test",
+    isCancelled: () => cancelled
+  }), e => e.code === "HERMES_TURN_CANCELLED");
+  assert.equal(lateCalls, 2); // A dispatched request cannot be undone.
+
+  console.log("session route recovery: 5 scenarios passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });
