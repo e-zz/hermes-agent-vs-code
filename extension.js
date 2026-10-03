@@ -1259,10 +1259,22 @@ class HermesSidebarProvider {
    * model with different credentials stay distinguishable.
    */
   async requestSessionWithRouteChoice(client, method, params, session) {
+    // isCancelled: when an active /stop has cancelled the owning turn, the
+    // route-recovery retry must not proceed — the user's "stop" is the latest
+    // instruction. Reuse TurnCancelledError (never wrap as a route block or
+    // re-prompt). Without this check the confirmed QuickPick still triggers a
+    // second resume + set_model + saveSessions, contradicting the cancel.
+    const turn = this.activeTurns.get(session.id);
+    const isCancelled = () => Boolean(turn?.lifecycle?.cancelled) ||
+      Boolean(turn?.assistantMessage && turn.assistantMessage.status === "stopped");
     const result = await requestSessionRoute({
-      request: (name, payload) => client.request(name, payload),
+      request: async (name, payload) => {
+        if (name === "session/resume" && isCancelled()) throw new TurnCancelledError();
+        return client.request(name, payload);
+      },
       method, params,
       chooseRoute: async () => {
+        if (isCancelled()) return undefined;
         const options = this.modelStateForSession(session).options || [];
         const items = options.filter(option => !option.unavailable && /^custom:[^:]+:.+$/.test(option.id))
           .map(option => ({label: option.name || option.id, description: option.id, modelId: option.id}));
@@ -1832,7 +1844,15 @@ class HermesSidebarProvider {
         this.postState();
         return;
       }
-      if (lifecycle.cancelled) throw new TurnCancelledError();
+      if (lifecycle.cancelled) {
+        // The turn was stopped (e.g. /stop while the route chooser was open).
+        // A cancelled turn has nothing to isolate, so the /stop path's
+        // cancellation barrier must be released here — otherwise every later
+        // /stop for this session deadlocks on the abandoned barrier.
+        const barrier = this.cancellationBarriers.open(session.id);
+        if (barrier.owner) barrier.release();
+        throw new TurnCancelledError();
+      }
       throw error;
     } finally {
       if (!detached) {

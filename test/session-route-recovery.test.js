@@ -1,6 +1,8 @@
 "use strict";
 const assert = require("node:assert/strict");
+const path = require("node:path");
 const { requestSessionRoute } = require("../lib/session-route-recovery");
+const pkg = require("../package.json");
 
 (async () => {
   const calls = [];
@@ -42,5 +44,24 @@ const { requestSessionRoute } = require("../lib/session-route-recovery");
   });
   assert.equal(chooses, 0);
   assert.equal(ready.selectedModel, undefined);
+  // Wiring: the dedicated recovery checks must be runnable standalone and the
+  // existing chains must cover both recovery tests (lint) and this test (run).
+  {
+    assert.equal(typeof pkg.scripts["lint:recovery"], "string", "lint:recovery script must exist");
+    assert.equal(typeof pkg.scripts["test:recovery"], "string", "test:recovery script must exist");
+    assert.ok(pkg.scripts["lint:recovery"].includes("node --check " + path.join("lib", "session-route-recovery.js").split(path.sep).join("/")), "lint:recovery must node --check lib/session-route-recovery.js");
+    assert.ok(pkg.scripts["lint:recovery"].includes(path.join("test", "session-route-recovery.test.js").split(path.sep).join("/")), "lint:recovery must node --check this test");
+    assert.ok(pkg.scripts["lint:recovery"].includes(path.join("test", "session-route-recovery-extension.test.js").split(path.sep).join("/")), "lint:recovery must node --check the extension wiring test");
+    assert.ok(pkg.scripts["lint:recovery"].includes(path.join("extension.js").split(path.sep).join("/")), "lint:recovery must node --check extension.js");
+    assert.ok(pkg.scripts["lint:recovery"].includes(path.join("package.json")), "lint:recovery must also check package.json (kept in sync with this assertion)");
+    assert.ok(pkg.scripts["test:recovery"].includes(path.join("test", "session-route-recovery.test.js").split(path.sep).join("/")), "test:recovery must run this test");
+    assert.ok(pkg.scripts["test:recovery"].includes(path.join("test", "session-route-recovery-extension.test.js").split(path.sep).join("/")), "test:recovery must run the extension wiring test");
+    // The wiring test is a new unit: it joins the lint chain and gets a
+    // dedicated entry in test:unit (the historical run order is preserved).
+    assert.ok(pkg.scripts.lint.includes(path.join("test", "session-route-recovery-extension.test.js").split(path.sep).join("/")), "lint must node --check the extension wiring test");
+    assert.ok(pkg.scripts["test:unit"].includes(path.join("test", "session-route-recovery-extension.test.js").split(path.sep).join("/")), "test:unit must run the extension wiring test");
+    assert.ok(pkg.scripts["test:unit"].includes(path.join("test", "session-route-recovery.test.js").split(path.sep).join("/")), "test:unit must keep running this test");
+  }
+
   console.log("session route recovery: 4 scenarios passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });
