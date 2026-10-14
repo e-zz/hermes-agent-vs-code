@@ -59,25 +59,6 @@ const state = {
   }
 };
 
-const reasoningEfforts = [
-  { label: "Low", value: "low" },
-  { label: "Medium", value: "medium" },
-  { label: "High", value: "high" },
-  { label: "Extra High", value: "xhigh" },
-  { label: "Max", value: "max" },
-  { label: "Ultra", value: "ultra" }
-];
-
-function reasoningLabel(value) {
-  return reasoningEfforts.find(option => option.value === value)?.label || "Default";
-}
-
-function compactReasoningLabel(value) {
-  const label = reasoningLabel(value);
-  if (label === "Medium") return "Med";
-  return label === "Extra High" ? "XHigh" : label;
-}
-
 const icons = {
   history: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 7v5l3 2"/></svg>',
   add: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg>',
@@ -991,9 +972,12 @@ function glyphFor(type) {
 
 function renderPopovers() {
   const selectedModel = state.models.find(model => model.id === state.settings.model);
+  const effort = state.settings.reasoningEffort;
   const refreshStatus = state.settings.modelRefreshStatus || "idle";
   const refreshLabel = refreshStatus === "refreshing" ? "Refreshing…" : "Refresh models";
   const refreshFeedback = refreshStatus === "refreshed" ? "Refreshed" : refreshStatus === "failed" ? "Failed" : "";
+  const current = effort?.options?.find(option => option.value === effort.currentValue);
+  const currentLabel = current?.name || effort?.currentValue || "Default";
   return `<div class="popover ${state.contextOpen ? "open" : ""}" id="contextPopover">
       <div class="popover-head"><span>Add workspace context</span></div>
       <div class="option-list">${state.workspaceItems.length ? state.workspaceItems.map(item => `<button class="option" type="button" data-path="${h(item.path)}" title="${h(item.path)}">${item.type === "folder" ? icons.folder : icons.file}<span class="option-name">${h(item.name)}</span></button>`).join("") : `<div class="option-empty">No files found</div>`}</div>
@@ -1024,10 +1008,10 @@ function renderPopovers() {
               ${icons.chevron.replace("<svg", '<svg class="dropdown-icon"')}
             </div>
           </div>
-          ${state.settings.reasoningEffortSupported ? `<div class="effort-field">
+          ${state.settings.reasoningEffortSupported && state.settings.reasoningEffort ? `<div class="effort-field">
             <span class="model-label">Effort</span>
-            <button class="model-picker-button" id="effortPickerButton" type="button" disabled aria-disabled="true" title="Reasoning effort is read from the Hermes config (agent.reasoning_overrides). Changing it from inside a session needs ACP support for the thought_level config option — see e-zz/hermes-agent#12.">
-              <span><strong>Set in Hermes config</strong><small>Not changeable in-session yet</small></span>
+            <button class="model-picker-button" id="effortPickerButton" type="button" aria-haspopup="listbox" aria-expanded="${state.effortPickerOpen}">
+              <span><strong>${h(currentLabel)}</strong><small>Hermes ACP session setting</small></span>
             </button>
           </div>` : ""}
         </div>
@@ -1068,10 +1052,11 @@ function renderModelOverlay() {
       </div>`;
     }).join("") : `<div class="model-no-match" role="option" aria-disabled="true">No matching models</div>`}
   </div>` : "";
-  const effortList = state.effortPickerOpen && state.settings.reasoningEffortSupported ? `<div class="effort-list open" id="effortList" role="listbox" aria-label="Reasoning effort">
-    ${reasoningEfforts.map((option, index) => {
-      const selected = state.settings.reasoningByModel?.[state.settings.model] === option.value;
-      return `<button class="effort-option ${selected ? "active" : ""}" type="button" role="option" aria-selected="${selected}" tabindex="${index === state.effortFocusIndex ? "0" : "-1"}" data-effort-index="${index}" data-effort="${option.value}"><span>${option.label}</span><span>${selected ? "✓" : ""}</span></button>`;
+  const effort = state.settings.reasoningEffort;
+  const effortList = state.effortPickerOpen && effort ? `<div class="effort-list open" id="effortList" role="listbox" aria-label="Reasoning effort">
+    ${effort.options.map((option, index) => {
+      const selected = effort.currentValue === option.value;
+      return `<button class="effort-option ${selected ? "active" : ""}" type="button" role="option" aria-selected="${selected}" tabindex="${index === state.effortFocusIndex ? "0" : "-1"}" data-effort-index="${index}" data-effort="${h(option.value)}"><span>${h(option.name)}</span><span>${selected ? "✓" : ""}</span></button>`;
     }).join("")}
   </div>` : "";
   root.innerHTML = modelList + effortList;
@@ -1108,7 +1093,8 @@ function bindSettingsOverlay() {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        state.effortFocusIndex = (state.effortFocusIndex + direction + reasoningEfforts.length) % reasoningEfforts.length;
+        const options = state.settings.reasoningEffort?.options || [];
+        state.effortFocusIndex = (state.effortFocusIndex + direction + options.length) % options.length;
         renderModelOverlay();
         focusEffortOption();
       } else if (event.key === "Enter" || event.key === " ") {
@@ -1692,8 +1678,8 @@ function bind() {
   document.querySelector("#effortPickerButton")?.addEventListener("click", () => {
     state.effortPickerOpen = !state.effortPickerOpen;
     closeModelPicker();
-    const selectedEffort = state.settings.reasoningByModel?.[state.settings.model];
-    const selectedIndex = reasoningEfforts.findIndex(option => option.value === selectedEffort);
+    const selectedEffort = state.settings.reasoningEffort?.currentValue;
+    const selectedIndex = (state.settings.reasoningEffort?.options || []).findIndex(option => option.value === selectedEffort);
     state.effortFocusIndex = selectedIndex >= 0 ? selectedIndex : 0;
     render();
     if (state.effortPickerOpen) focusEffortOption();
@@ -2013,12 +1999,9 @@ function selectModel(modelId) {
   render();
 }
 
-function selectReasoningEffort(modelId, effort) {
-  if (!state.settings.reasoningEffortSupported) return;
-  const selected = state.models.find(model => model.id === modelId);
-  if (!selected || selected.unavailable || !reasoningEfforts.some(option => option.value === effort)) return;
-  state.settings.model = modelId;
-  state.settings.reasoningByModel = { ...(state.settings.reasoningByModel || {}), [modelId]: effort };
+function selectReasoningEffort(_modelId, effort) {
+  const available = state.settings.reasoningEffort;
+  if (!available?.options?.length || !available.options.some(option => option.value === effort)) return;
   state.effortPickerOpen = false;
   settingsChanged(effort);
   render();
@@ -2096,6 +2079,7 @@ window.addEventListener("message", event => {
     const previousSettingsUi = JSON.stringify({
       model: state.settings.model,
       reasoningByModel: state.settings.reasoningByModel,
+      reasoningEffort: state.settings.reasoningEffort,
       reasoningEffortSupported: state.settings.reasoningEffortSupported,
       modelRefreshStatus: state.settings.modelRefreshStatus,
       models: state.models
@@ -2111,6 +2095,7 @@ window.addEventListener("message", event => {
     state.sessions = message.sessions || [];
     state.activeSessionId = message.activeSessionId;
     state.settings = { ...state.settings, ...(message.settings || {}) };
+    if (message.settings?.reasoningEffort) state.settings.reasoningEffortSupported = true;
     if (!state.settings.reasoningEffortSupported) state.effortPickerOpen = false;
     state.queue = message.queue || [];
     if (state.editingQueueId && !state.queue.some(item => item.id === state.editingQueueId)) {
@@ -2121,6 +2106,7 @@ window.addEventListener("message", event => {
     const settingsUiChanged = previousSettingsUi !== JSON.stringify({
       model: state.settings.model,
       reasoningByModel: state.settings.reasoningByModel,
+      reasoningEffort: state.settings.reasoningEffort,
       reasoningEffortSupported: state.settings.reasoningEffortSupported,
       modelRefreshStatus: state.settings.modelRefreshStatus,
       models: state.models

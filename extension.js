@@ -907,16 +907,27 @@ class HermesSidebarProvider {
       this.postState();
       return false;
     }
-    const requestedEffort = String(settings.reasoningEffort || "").toLowerCase();
+    const requestedEffort = String(settings.reasoningEffort || "").trim();
     const reasoningByModel = rememberReasoningEffort(previous.reasoningByModel || {}, selectedModel, requestedEffort);
     const modelChanged = Boolean(selectedModel && selectedModel !== previous.model);
-    // Reasoning effort is deliberately NOT applied from here. ACP has no method to set it, and
-    // Hermes does not expose the thought_level session config option, so the former workaround
-    // wrote the user's GLOBAL agent.reasoning_overrides through the Hermes CLI and then forced a
-    // rebuild — a client mutating the server's persistent config, with the side effect also
-    // landing on CLI/TUI/gateway/cron. That write is removed (see the acpArgs note). The Effort
-    // control is disabled until Hermes exposes thought_level (e-zz/hermes-agent#12); the level
-    // then comes from Hermes' own config.
+    const oldReasoning = session.reasoningEffort;
+    const effortChanged = Boolean(requestedEffort && oldReasoning && requestedEffort !== oldReasoning.currentValue);
+    if (effortChanged && acpSessionId && this.acp) {
+      try {
+        const result = await this.acp.request("session/set_config_option", {
+          sessionId: acpSessionId,
+          configId: "thought_level",
+          value: requestedEffort
+        });
+        const configResult = result?.configOptions || result?.config_options;
+        if (configResult) this.applyAcpSessionState(session, acpSessionId, undefined, configResult);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Unable to apply Hermes reasoning effort: ${error.message}`);
+        this.postState();
+        return false;
+      }
+    }
+
     if (selectedModel && acpSessionId && this.acp && modelChanged) {
       try {
         // Hermes rebuilds the session Agent on set_model, which re-reads config; this is the
@@ -1207,7 +1218,19 @@ class HermesSidebarProvider {
     }
     const runtimeModels = normalizeModelState(models);
     if (runtimeModels.options.length) session.modelState = runtimeModels;
-    session.reasoningEffortSupported = true;
+    if (configOptions !== undefined) {
+      const thoughtLevel = extractThoughtLevel(configOptions);
+      if (thoughtLevel) session.reasoningEffort = thoughtLevel;
+      else delete session.reasoningEffort;
+    }
+  }
+
+  applyAcpConfigOptionUpdate(acpSessionId, configOptions) {
+    const session = this.sessions.find(item => this.acpSessions.get(item.id) === acpSessionId);
+    if (!session) return false;
+    this.applyAcpSessionState(session, acpSessionId, undefined, configOptions);
+    this.postState();
+    return true;
   }
 
   async refreshHermesSessions() {
@@ -2096,8 +2119,7 @@ class HermesSidebarProvider {
             const session = this.sessions.find(s => this.acpSessions.get(s.id) === acpSessionId);
             if (session) {
               const configOptions = update.configOptions || update.config_options || [];
-              this.applyAcpSessionState(session, acpSessionId, undefined, configOptions);
-              this.postState();
+              this.applyAcpConfigOptionUpdate(acpSessionId, configOptions);
             }
             return;
           }
@@ -3669,7 +3691,8 @@ class HermesSidebarProvider {
         mode: sessionSettings.mode || config.get("defaultMode", "Auto"),
         model: selectedModel,
         reasoningByModel: sessionSettings.reasoningByModel || {},
-        reasoningEffortSupported: Boolean(selectedModel),
+        reasoningEffortSupported: Boolean(session.reasoningEffort),
+        reasoningEffort: session.reasoningEffort || null,
         modelRefreshStatus: session.modelRefreshStatus || "idle",
         skills: merged,
         commands
@@ -3805,6 +3828,14 @@ function saveLastReasoningByModel(ctx, reasoningByModel) {
   } catch { /* best-effort */ }
 }
 
+function extractThoughtLevel(configOptions) {
+  const option = (Array.isArray(configOptions) ? configOptions : []).find(item => item?.id === "thought_level");
+  if (!option || !Array.isArray(option.options)) return undefined;
+  return {
+    currentValue: String(option.currentValue ?? ""),
+    options: option.options.map(item => ({ value: item.value, name: item.name }))
+  };
+}
 function cloneMessage(message) {
   return { ...JSON.parse(JSON.stringify(message)), id: id() };
 }
