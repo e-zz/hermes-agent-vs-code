@@ -4,3 +4,6 @@ node_modules/
 .vscode-test/
 test/artifacts/
 debug.log
+
+# 本地计划文档：按约定不推送（随源码留在 docs/，但不进远端）
+docs/PLAN-*.md
