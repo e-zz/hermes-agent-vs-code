@@ -17,7 +17,6 @@ const { forkAcpSession, installAcpSessionReplacement } = require("./lib/acp-sess
 const { buildGeneratedDocumentCandidates } = require("./lib/generated-document");
 const { buildHermesPromptBlocks, mergeHermesSessions } = require("./lib/hermes-sessions");
 const { configuredModelState, latestRuntimeModelState, mergeRefreshedModels, normalizeModelState, normalizeReasoningByModel, rememberReasoningEffort, resolveSelectedModel } = require("./lib/model-settings");
-const { persistModelReasoningEffort } = require("./lib/reasoning-config");
 const { markSessionCompleted, markSessionViewed, normalizeWorkspaceAgentState, resolveWorkspaceSessionId, sessionIsRunning } = require("./lib/session-metadata");
 const { prepareDocumentReviewBatch } = require("./lib/document-review");
 const { projectV4aUpdatePreview } = require("./lib/v4a-preview");
@@ -910,28 +909,18 @@ class HermesSidebarProvider {
     }
     const requestedEffort = String(settings.reasoningEffort || "").toLowerCase();
     const reasoningByModel = rememberReasoningEffort(previous.reasoningByModel || {}, selectedModel, requestedEffort);
-    const effectiveEffort = selectedModel && reasoningByModel[selectedModel];
-    const reasoningChanged = Boolean(requestedEffort && effectiveEffort !== previous.reasoningByModel?.[selectedModel]);
     const modelChanged = Boolean(selectedModel && selectedModel !== previous.model);
-    if (effectiveEffort && (reasoningChanged || modelChanged)) {
+    // Reasoning effort is deliberately NOT applied from here. ACP has no method to set it, and
+    // Hermes does not expose the thought_level session config option, so the former workaround
+    // wrote the user's GLOBAL agent.reasoning_overrides through the Hermes CLI and then forced a
+    // rebuild — a client mutating the server's persistent config, with the side effect also
+    // landing on CLI/TUI/gateway/cron. That write is removed (see the acpArgs note). The Effort
+    // control is disabled until Hermes exposes thought_level (e-zz/hermes-agent#12); the level
+    // then comes from Hermes' own config.
+    if (selectedModel && acpSessionId && this.acp && modelChanged) {
       try {
-        const command = vscode.workspace.getConfiguration("hermesAgent").get("command", "");
-        await persistModelReasoningEffort({
-          command,
-          model: selectedModel,
-          effort: effectiveEffort,
-          env: { HERMES_HOME }
-        });
-      } catch (error) {
-        vscode.window.showErrorMessage(`Unable to set Hermes reasoning effort: ${error.message}`);
-        this.postState();
-        return false;
-      }
-    }
-    if (selectedModel && acpSessionId && this.acp && (modelChanged || reasoningChanged)) {
-      try {
-        // Hermes rebuilds the session Agent on set_model, which reloads the
-        // per-model reasoning override written through its own config CLI.
+        // Hermes rebuilds the session Agent on set_model, which re-reads config; this is the
+        // only legitimate trigger left (model/provider change), never a reasoning-effort write.
         await this.acp.request("session/set_model", {
           sessionId: acpSessionId,
           modelId: selectedModel
@@ -2056,35 +2045,23 @@ class HermesSidebarProvider {
   /**
    * Build the argv for the ACP server.
    *
-   * Reasoning effort is passed as a real CLI argument (`--reasoning <level>`)
-   * instead of being persisted into `agent.reasoning_overrides`. The config-writing
-   * path was unreliable: it required the spawned CLI to resolve the same Hermes home
-   * as the user, and a per-model override keyed by a provider-prefixed model id
-   * (`custom:<provider>:<model>`) did not always match what the runtime looks up.
-   * A launch argument has no such ambiguity — it is resolved for this process only.
+   * Reasoning effort is deliberately NOT set here. `--reasoning` is a top-level Hermes flag,
+   * but `cmd_acp` forwards only its own flags (hermes_cli/main_agent_cmds.py `_ACP_FLAGS`), so
+   * `hermes --reasoning high acp` parses the flag and then drops it. An ACP session resolves its
+   * effort through `resolve_reasoning_config(config, model)` (acp_adapter/session.py) — from
+   * `agent.reasoning_overrides` (per model) or the global `agent.reasoning_effort`, never from a
+   * launch flag. Setting it per process would also be wrong: one ACP server hosts every session,
+   * so a launch level would leak one session's effort onto all of them.
    *
-   * `--reasoning` is a TOP-LEVEL flag, so it must precede the `acp` subcommand:
-   * `hermes --reasoning high acp` (NOT `hermes acp --reasoning high`).
+   * Effort is also NOT applied from updateSessionSettings any more. The former workaround wrote
+   * the user's GLOBAL `agent.reasoning_overrides` via the Hermes CLI and forced a rebuild, which
+   * made a client mutate the server's persistent config (and leak onto CLI/TUI/gateway/cron, and
+   * across providers, since the override is keyed by model slug only). It is gone. ACP clients
+   * get a session effort selector only once Hermes advertises the `thought_level` config option
+   * and honours `session/set_config_option` — tracked in e-zz/hermes-agent#12.
    */
   acpArgs() {
-    const args = [];
-    const effort = this.currentReasoningEffort();
-    if (effort) args.push("--reasoning", effort);
-    args.push("acp");
-    return args;
-  }
-
-  /** The most recently persisted effort for the active model, or "" when unset. */
-  currentReasoningEffort() {
-    const allowed = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
-    try {
-      const session = this.activeSession(this.activeSessionId);
-      const settings = session?.settings || {};
-      const model = settings.model || vscode.workspace.getConfiguration("hermesAgent").get("model", "");
-      const value = String(settings.reasoningByModel?.[model] || "").trim().toLowerCase();
-      if (allowed.has(value)) return value;
-    } catch { /* fall through to unset */ }
-    return "";
+    return ["acp"];
   }
 
   async startAcpClient(command) {

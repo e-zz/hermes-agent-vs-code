@@ -1026,9 +1026,8 @@ function renderPopovers() {
           </div>
           ${state.settings.reasoningEffortSupported ? `<div class="effort-field">
             <span class="model-label">Effort</span>
-            <button class="model-picker-button" id="effortPickerButton" type="button" aria-haspopup="listbox" aria-expanded="${state.effortPickerOpen}">
-              <span><strong>${h(reasoningLabel(state.settings.reasoningByModel?.[state.settings.model]))}</strong><small>Reasoning effort for this model</small></span>
-              ${icons.chevron.replace("<svg", '<svg class="dropdown-icon"')}
+            <button class="model-picker-button" id="effortPickerButton" type="button" disabled aria-disabled="true" title="Reasoning effort is read from the Hermes config (agent.reasoning_overrides). Changing it from inside a session needs ACP support for the thought_level config option — see e-zz/hermes-agent#12.">
+              <span><strong>Set in Hermes config</strong><small>Not changeable in-session yet</small></span>
             </button>
           </div>` : ""}
         </div>
@@ -1350,8 +1349,9 @@ function renderPromptLine(running, contextChip) {
 function runSettingsSummary() {
   const selectedModel = state.models.find(model => model.id === state.settings.model);
   const model = HermesModelPicker.displayModelName(selectedModel) || state.settings.model || "Model";
-  const effort = compactReasoningLabel(state.settings.reasoningByModel?.[state.settings.model]);
-  const full = `${state.settings.mode} · ${model} · ${effort}`;
+  // No effort segment: the level is not settable from this client (see the Effort control note),
+  // so echoing a locally remembered value here would present a preference as the effective level.
+  const full = `${state.settings.mode} · ${model}`;
   return { compact: full, full };
 }
 
